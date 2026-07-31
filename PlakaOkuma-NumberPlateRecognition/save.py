@@ -2,12 +2,13 @@ import datetime
 from time import time
 
 def write(message):
-    f = open("data.txt", "r")
-    result = f.read().find(message)
-    f.close()
-    if result ==-1:
-        time = datetime.datetime.now()
-        f = open("data.txt","a")    
-        f.write(message +" ")
-        f.write(str(time)+"\n")
-        f.close
+    try:
+        f = open("data.txt", "a+")
+        f.seek(0)
+        content = f.read()
+        if message not in content:
+            now = datetime.datetime.now()
+            f.write(f"{message} {now}\n")
+        f.close()
+    except Exception as e:
+        print(f"Kaydetme hatası: {e}")
