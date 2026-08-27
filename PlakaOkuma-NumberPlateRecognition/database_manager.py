@@ -70,14 +70,21 @@ _init()
 
 
 def _save_async():
-    """Workbook'u arka plan thread'inde diske yazar. GIL'i ana thread'den çalmaz."""
+    """Workbook'u arka plan thread'inde güvenli ve atomik şekilde diske yazar."""
     def _do():
         with _save_lock:
             try:
-                _wb.save(EXCEL_PATH)
+                temp_path = EXCEL_PATH + ".tmp"
+                _wb.save(temp_path)
+                if os.path.exists(temp_path) and os.path.getsize(temp_path) > 1000:
+                    if os.path.exists(EXCEL_PATH):
+                        os.replace(temp_path, EXCEL_PATH)
+                    else:
+                        os.rename(temp_path, EXCEL_PATH)
             except Exception as e:
                 print(f"[database_manager] Excel kayıt hatası: {e}")
-    threading.Thread(target=_do, daemon=True).start()
+    t = threading.Thread(target=_do, daemon=False)
+    t.start()
 
 
 # ── Yardımcılar ───────────────────────────────────────────────────────────────
@@ -93,15 +100,88 @@ def _safe(val) -> str:
     return s
 
 
+import difflib
+
+# Modelin sıklıkla karıştırabileceği görsel karakter çiftleri
+CONFUSABLE_PAIRS = {
+    ('O', 'D'), ('D', 'O'),
+    ('O', '0'), ('0', 'O'),
+    ('O', 'Q'), ('Q', 'O'),
+    ('B', '8'), ('8', 'B'),
+    ('I', '1'), ('1', 'I'),
+    ('L', '1'), ('1', 'L'),
+    ('Z', '2'), ('2', 'Z'),
+    ('S', '5'), ('5', 'S'),
+    ('G', '6'), ('6', 'G'),
+    ('A', '4'), ('4', 'A')
+}
+
+def calculate_plate_similarity(p1: str, p2: str) -> float:
+    """
+    İki plaka arasındaki karakter ve optik benzerlik oranını hesaplar (0.0 - 1.0).
+    """
+    p1 = p1.upper().replace(' ', '')
+    p2 = p2.upper().replace(' ', '')
+    if p1 == p2:
+        return 1.0
+    
+    max_len = max(len(p1), len(p2))
+    if max_len == 0 or abs(len(p1) - len(p2)) > 1:
+        return 0.0
+        
+    # Karakter bazlı ağırlıklı eşleşme
+    if len(p1) == len(p2):
+        score = 0.0
+        for c1, c2 in zip(p1, p2):
+            if c1 == c2:
+                score += 1.0
+            elif (c1, c2) in CONFUSABLE_PAIRS:
+                score += 0.90 # Karıştırılabilir görsel benzerlik puanı (O/D, B/8, I/1)
+        return score / max_len
+    else:
+        return difflib.SequenceMatcher(None, p1, p2).ratio()
+
+
 def _find_row(plaka_clean: str):
-    """Plakanın satır numarasını (1-tabanlı) döner. Bulunamazsa None."""
+    """
+    Plakanın satır numarasını ve eşleşen veritabanı plakasını döner:
+    1. Birebir tam eşleşme arar (%100).
+    2. Tam eşleşme yoksa veritabanındaki kayıtlarla Bulanık Eşleştirme (Fuzzy Match) yapar.
+       Eğer benzerlik >= %85 ise o satırı döner (Örn: 34 OPR 073 -> 34 DPR 073).
+    Dönüş: (row_idx, matched_db_plaka, similarity_ratio) veya (None, None, 0.0)
+    """
     if _ws is None:
-        return None
+        return None, None, 0.0
+        
+    # 1. Aşama: Birebir Tam Eşleşme
     for row_idx in range(2, _ws.max_row + 1):
         cell_val = _safe(_ws.cell(row=row_idx, column=COL_PLAKA + 1).value)
-        if cell_val.upper().replace(" ", "") == plaka_clean:
-            return row_idx
-    return None
+        db_p = cell_val.upper().replace(" ", "")
+        if db_p == plaka_clean:
+            return row_idx, db_p, 1.0
+            
+    # 2. Aşama: %85 ve Üzeri Bulanık Eşleştirme (Fuzzy Matching)
+    best_row = None
+    best_db_plaka = None
+    best_similarity = 0.0
+    
+    for row_idx in range(2, _ws.max_row + 1):
+        cell_val = _safe(_ws.cell(row=row_idx, column=COL_PLAKA + 1).value)
+        db_p = cell_val.upper().replace(" ", "")
+        if not db_p:
+            continue
+            
+        sim = calculate_plate_similarity(plaka_clean, db_p)
+        if sim > best_similarity:
+            best_similarity = sim
+            best_row = row_idx
+            best_db_plaka = db_p
+            
+    if best_similarity >= 0.85 and best_row is not None:
+        print(f"[Akilli Plaka Esleme] Okunan: {plaka_clean} -> Veritabanindaki: {best_db_plaka} (Eslesme: %{best_similarity*100:.1f})")
+        return best_row, best_db_plaka, best_similarity
+        
+    return None, None, 0.0
 
 
 def _append_json_log(entry: dict):
@@ -166,7 +246,7 @@ def process_plate(plaka: str) -> dict:
 
     with _wb_lock:   # In-memory erişim — GIL yalnızca bu blok boyunca tutulur (hızlı)
         try:
-            row_idx = _find_row(plaka_clean)
+            row_idx, matched_plaka, similarity = _find_row(plaka_clean)
 
             # ── YABANCI ARAÇ ─────────────────────────────────────────────────
             if row_idx is None:
@@ -178,6 +258,10 @@ def process_plate(plaka: str) -> dict:
                     "durum":  "Yabancı Araç", "zaman": now.strftime("%H:%M:%S"),
                 })
                 return result
+
+            # Eğer bulanık eşleşmeyle düzeltildiyse sonucu resmi veritabanı plakası yap
+            if matched_plaka and matched_plaka != plaka_clean:
+                result["plaka"] = matched_plaka
 
             # Satır verilerini oku
             def cell(col_idx):
@@ -206,9 +290,16 @@ def process_plate(plaka: str) -> dict:
                 cikis_str = now.strftime("%H:%M:%S")
                 sure_str  = ""
                 if isinstance(giris_dt, datetime):
-                    total_min = int((now - giris_dt).total_seconds() // 60)
+                    total_sec = int((now - giris_dt).total_seconds())
+                    total_min = total_sec // 60
                     saat, dakika = divmod(total_min, 60)
-                    sure_str = f"{saat}sa {dakika}dk" if saat else f"{dakika}dk"
+                    saniye = total_sec % 60
+                    if saat > 0:
+                        sure_str = f"{saat}sa {dakika}dk"
+                    elif dakika > 0:
+                        sure_str = f"{dakika}dk {saniye}sn"
+                    else:
+                        sure_str = f"{saniye}sn"
 
                 # In-memory güncelle
                 _ws.cell(row=row_idx, column=COL_DURUM + 1).value = DURUM_CIKIS
